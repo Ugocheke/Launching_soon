@@ -1,0 +1,2 @@
+python-telegram-bot==20.4
+google-cloud-firestore==2.11.0
