@@ -14,7 +14,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Any
 
-import asyncpg
+from supabase import create_client, Client
 from telegram import Bot
 from telegram.constants import ParseMode
 from telegram.error import TelegramError
@@ -25,14 +25,125 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-SUPABASE_DB_URL = os.getenv("SUPABASE_DB_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 TARGET_CHAT = os.getenv("TARGET_CHAT")  # optional
 
-UPDATE_INTERVAL_SECONDS = 60
+if not TELEGRAM_TOKEN or not SUPABASE_URL or not SUPABASE_KEY:
+    raise RuntimeError("Missing required env vars: TELEGRAM_TOKEN, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY")
 
-if not TELEGRAM_TOKEN or not SUPABASE_URL or not SUPABASE_KEY or not SUPABASE_DB_URL:
-    raise RuntimeError("Missing one or more required env vars: TELEGRAM_TOKEN, SUPABASE_URL, SUPABASE_KEY, SUPABASE_DB_URL")
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+countdown_tasks: Dict[int, asyncio.Task] = {}
+
+# ---------------- UTILITIES ----------------
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+def normalize_countdown(days: int, hours: int, minutes: int) -> timedelta:
+    return timedelta(days=days, hours=hours, minutes=minutes)
+
+def format_remaining(td: timedelta) -> str:
+    if td.total_seconds() <= 0:
+        return "⏰ Countdown finished!"
+    total_minutes = int(td.total_seconds() // 60)
+    days = total_minutes // (24 * 60)
+    hours = (total_minutes % (24 * 60)) // 60
+    minutes = total_minutes % 60
+    return f"⏳ {days:02d}d : {hours:02d}h : {minutes:02d}m"
+
+# ---------------- DATABASE ----------------
+async def save_countdown(message_id: int, chat_id: str, end_time: datetime, post_text: str):
+    supabase.table("countdowns").upsert({
+        "message_id": message_id,
+        "chat_id": str(chat_id),
+        "end_time": end_time.isoformat(),
+        "post_text": post_text,
+    }).execute()
+
+async def delete_countdown(message_id: int):
+    supabase.table("countdowns").delete().eq("message_id", message_id).execute()
+
+async def load_all_countdowns():
+    result = supabase.table("countdowns").select("*").execute()
+    return result.data or []
+
+# ---------------- COUNTDOWN LOGIC ----------------
+async def run_countdown(bot: Bot, chat_id: str, post_text: str, end_time: datetime, message_id: int):
+    try:
+        while True:
+            now = utc_now()
+            remaining = end_time - now
+            text = f"{post_text}\n\n{format_remaining(remaining)}"
+            try:
+                await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text, parse_mode=ParseMode.HTML)
+            except TelegramError as e:
+                logging.warning(f"Edit failed: {e}")
+            if remaining.total_seconds() <= 0:
+                await delete_countdown(message_id)
+                countdown_tasks.pop(message_id, None)
+                break
+            await asyncio.sleep(60)
+    except asyncio.CancelledError:
+        logging.info(f"Countdown task cancelled ({message_id})")
+
+# ---------------- COMMANDS ----------------
+async def start_countdown(update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if len(args) < 3:
+        await update.message.reply_text("Usage: /start_countdown <days> <hours> <minutes> [message]")
+        return
+
+    try:
+        days, hours, minutes = map(int, args[:3])
+    except ValueError:
+        await update.message.reply_text("Days, hours, and minutes must be integers.")
+        return
+
+    custom_text = " ".join(args[3:]) if len(args) > 3 else "Countdown"
+    end_time = utc_now() + normalize_countdown(days, hours, minutes)
+    chat_id = TARGET_CHAT or update.effective_chat.id
+    bot = context.bot
+
+    sent = await bot.send_message(chat_id=chat_id, text=custom_text, parse_mode=ParseMode.HTML)
+    await save_countdown(sent.message_id, chat_id, end_time, custom_text)
+
+    task = asyncio.create_task(run_countdown(bot, chat_id, custom_text, end_time, sent.message_id))
+    countdown_tasks[sent.message_id] = task
+
+async def stop_countdown(update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Usage: /stop_countdown <message_id>")
+        return
+    mid = int(context.args[0])
+    task = countdown_tasks.pop(mid, None)
+    if task:
+        task.cancel()
+    await delete_countdown(mid)
+    await update.message.reply_text(f"Countdown {mid} stopped.")
+
+# ---------------- STARTUP ----------------
+async def reschedule_on_startup(app):
+    bot = app.bot
+    now = utc_now()
+    rows = await load_all_countdowns()
+    for r in rows:
+        end_time = datetime.fromisoformat(r["end_time"])
+        if end_time > now:
+            task = asyncio.create_task(run_countdown(bot, r["chat_id"], r["post_text"], end_time, int(r["message_id"])))
+            countdown_tasks[int(r["message_id"])] = task
+        else:
+            await delete_countdown(int(r["message_id"]))
+
+# ---------------- MAIN ----------------
+async def main():
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    await reschedule_on_startup(app)
+    app.add_handler(CommandHandler("start_countdown", start_countdown))
+    app.add_handler(CommandHandler("stop_countdown", stop_countdown))
+    await app.run_polling()
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
 
 # ---------------- GLOBAL STATE ----------------
 countdown_tasks: Dict[int, asyncio.Task] = {}
